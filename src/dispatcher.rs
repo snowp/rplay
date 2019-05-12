@@ -29,21 +29,28 @@ impl Dispatcher {
             let farcc = farc.clone();
             threads.push(thread::spawn(move || {
                 ready_sender.send(true).unwrap();
-                let msg = work_receiver.recv().unwrap();
-                farcc(&msg);
-                ready_sender.send(true).unwrap();
+                loop {
+                    match work_receiver.recv() {
+                        Ok(msg) => {
+                            farcc(&msg);
+                            ready_sender.send(true).unwrap();
+                        }
+                        Err(e) => println!("got error while waiting for work {}", e),
+                    }
+                }
             }));
         }
 
         Dispatcher {
-            receive_thread: thread::spawn(move || {
+            receive_thread: thread::spawn(move || loop {
                 let msg = receiver.recv().unwrap();
-                loop {
-                    for (i, w) in ready_channels.iter().enumerate() {
-                        match w.try_recv() {
-                            Ok(_) => sender_channels[i].send(msg.clone()).unwrap(),
-                            Err(_) => (),
+                for (i, w) in ready_channels.iter().enumerate() {
+                    match w.try_recv() {
+                        Ok(_) => {
+                            sender_channels[i].send(msg.clone()).unwrap();
+                            break;
                         }
+                        Err(_) => (),
                     }
                 }
             }),

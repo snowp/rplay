@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::io::Result;
 use std::net::SocketAddr;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
 const SERVER_TOKEN: Token = Token(0);
@@ -86,7 +86,7 @@ impl Server {
                     }
                 } else {
                     match self.sessions.get_mut(&event.token()) {
-                        Some((ref mut s, ref a)) => {
+                        Some((ref mut s, _)) => {
                             let mut buffer = [0; 256];
                             match read_chunk(&mut buffer, s) {
                                 Ok(0) => println!("event with no output"),
@@ -95,7 +95,13 @@ impl Server {
                                         let mut cis =
                                             protobuf::stream::CodedInputStream::from_bytes(chunk);
                                         let mut m = protos::Message::new();
-                                        m.merge_from(&mut cis).unwrap();
+                                        match m.merge_from(&mut cis) {
+                                            Ok(_) => {}
+                                            Err(e) => {
+                                                println!("failed to parse message: {}", e);
+                                                println!("{:?}", chunk);
+                                            }
+                                        }
 
                                         let marc = Arc::new(m);
 
@@ -106,7 +112,9 @@ impl Server {
                                     None => println!("failed to read {} bytes", size),
                                 },
                                 Err(e) => {
-                                    if e.kind() == ErrorKind::WouldBlock {
+                                    if e.kind() == ErrorKind::WouldBlock
+                                        || e.kind() == ErrorKind::ConnectionReset
+                                    {
                                         continue;
                                     } else {
                                         println!("error reading: {}", e);
