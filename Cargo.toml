@@ -1,0 +1,11 @@
+[package]
+name = "rplay"
+version = "0.1.0"
+authors = ["Snow Pettersen <snowp@squareup.com>"]
+
+[dependencies]
+mio = "0.6"
+
+[[bin]]
+name = "rplay"
+path = "main.rs"
