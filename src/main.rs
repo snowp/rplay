@@ -5,30 +5,36 @@ mod dispatcher;
 mod protos;
 mod server;
 
-use protobuf::Message;
 use std::env;
 use std::sync::mpsc;
-use std::thread;
-use std::time;
 
-fn print_message(msg: &protos::Message) -> protos::Message {
-    if msg.get_annotations()["name"] == "call" {
-        let mut p = protos::Ping::new();
-        let mut cos = protobuf::CodedInputStream::from_bytes(msg.get_body());
-        p.merge_from(&mut cos).unwrap();
-        thread::sleep(time::Duration::from_millis(10));
+fn handler<F, S, T>(msg: &protos::Message, f: F) -> protos::Message
+where
+    F: Fn(&S) -> T,
+    S: protobuf::Message,
+    T: protobuf::Message,
+{
+    let mut request = S::new();
+    let mut cos = protobuf::CodedInputStream::from_bytes(msg.get_body());
+    request.merge_from(&mut cos).unwrap();
 
-        println!(
-            "received ping with data {:?} on thread {:?}",
-            p.get_data(),
-            thread::current().id()
-        );
-    }
-    let mut p = protos::Pong::new();
-    p.set_data("hi from server".to_string());
+    let response = f(&request);
     let mut m = protos::Message::new();
-    m.set_body(p.write_to_bytes().unwrap());
+    m.set_body(response.write_to_bytes().unwrap());
+
     m
+}
+
+macro_rules! handle {
+    ($name1:expr => $handler1:expr, $($name:expr => $handler:expr),*) => {{
+        |msg| match msg.get_method() {
+            $name1 => handler(msg, $handler1),
+            $(
+                $name => handler(msg, $handler),
+            )*
+            _ => protos::Message::new(),
+        }}
+    };
 }
 
 fn main() {
@@ -46,7 +52,14 @@ fn main() {
         let (s, r) = mpsc::channel();
         server.add_listener(s);
 
-        let _ = dispatcher::Dispatcher::new(r, 32, &print_message);
+        let _ = dispatcher::Dispatcher::new(
+            r,
+            32,
+            handle!{
+                "Echo" => |_request: &protos::Ping| -> protos::Pong { protos::Pong::new() },
+                "Bara" => |_request: &protos::Ping| -> protos::Pong { protos::Pong::new() }
+            },
+        );
         server.start();
     }
 }
