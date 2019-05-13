@@ -9,17 +9,14 @@ use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::io::Result;
 use std::net::SocketAddr;
+use std::ops::Deref;
+use std::sync::mpsc;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
+use std::thread;
+use std::thread::JoinHandle;
 
 const SERVER_TOKEN: Token = Token(0);
-
-pub struct Server {
-    sessions: HashMap<Token, (TcpStream, SocketAddr)>,
-    tcp_listener: TcpListener,
-    listeners: Vec<Sender<Arc<protos::Message>>>,
-    poll: Poll,
-}
 
 fn next_token(sessions: &HashMap<Token, (TcpStream, SocketAddr)>) -> Token {
     let mut t = 1;
@@ -43,14 +40,51 @@ fn read_chunk(buffer: &mut [u8], stream: &mut TcpStream) -> Result<(usize)> {
         Err(e) => Err(e),
     }
 }
+
+pub enum WriterEvent {
+    NewConnection((Token, TcpStream, SocketAddr)),
+    WriteData((Token, Arc<protos::Message>)),
+}
+
+pub struct Server {
+    sessions: HashMap<Token, (TcpStream, SocketAddr)>,
+    tcp_listener: TcpListener,
+    listeners: Vec<Sender<(Arc<protos::Message>, Token, Sender<WriterEvent>)>>,
+    poll: Poll,
+    writer_sender: Sender<WriterEvent>,
+    writer_thread: JoinHandle<()>,
+}
+
 impl Server {
     pub fn new(addr: &String) -> Self {
         let a = addr.parse().unwrap();
+        let (writer_sender, writer_receiver) = mpsc::channel();
+
+        let ss = HashMap::new();
         let s = Server {
-            sessions: HashMap::new(),
+            sessions: ss,
             tcp_listener: TcpListener::bind(&a).unwrap(),
             listeners: Vec::new(),
             poll: Poll::new().unwrap(),
+            writer_sender: writer_sender,
+            writer_thread: thread::spawn(move || {
+                let mut sessions = HashMap::new();
+                loop {
+                    match writer_receiver.recv().unwrap() {
+                        WriterEvent::NewConnection((token, stream, addr)) => {
+                            println!("got connetion {:?}", token);
+                            sessions.insert(token, (stream, addr));
+                        }
+                        WriterEvent::WriteData((token, msg)) => {
+                            println!("got data {:?}", token);
+                            let (ref mut stream, _) = sessions.get_mut(&token).unwrap();
+                            stream
+                                .write_bufs(&[msg.write_to_bytes().unwrap().as_slice().into()])
+                                .unwrap();
+                        }
+                    }
+                }
+            }),
         };
         s.poll
             .register(
@@ -63,6 +97,25 @@ impl Server {
         s
     }
 
+    fn insert_with_next_token(self: &mut Self, (session, addr): (TcpStream, SocketAddr)) -> Token {
+        let token = next_token(&self.sessions);
+
+        // Register events to poll for, and notify the sender thread about this connection.
+        self.poll
+            .register(&session, token, Ready::readable(), PollOpt::edge())
+            .unwrap();
+        self.writer_sender
+            .send(WriterEvent::NewConnection((
+                token,
+                session.try_clone().unwrap(),
+                addr,
+            )))
+            .unwrap();
+
+        self.sessions.insert(token, (session, addr));
+        token
+    }
+
     pub fn start(self: &mut Self) {
         let mut events = Events::with_capacity(1024);
         loop {
@@ -73,63 +126,55 @@ impl Server {
                     let a = self.tcp_listener.accept();
                     match a {
                         Ok((s, a)) => {
-                            let response = String::from("there you are\n");
-                            let buffers: [&IoVec; 1] = [response.as_str().as_bytes().into()];
-                            s.write_bufs(&buffers).unwrap();
-                            let token = next_token(&self.sessions);
-                            self.poll
-                                .register(&s, token, Ready::readable(), PollOpt::edge())
-                                .unwrap();
-                            self.sessions.insert(token, (s, a));
+                            self.insert_with_next_token((s, a));
                         }
                         Err(e) => println!("failed to accept: {}", e),
                     }
                 } else {
-                    match self.sessions.get_mut(&event.token()) {
-                        Some((ref mut s, _)) => {
-                            let mut buffer = [0; 256];
-                            match read_chunk(&mut buffer, s) {
-                                Ok(0) => println!("event with no output"),
-                                Ok(size) => match buffer.chunks(size).next() {
-                                    Some(chunk) => {
-                                        let mut cis =
-                                            protobuf::stream::CodedInputStream::from_bytes(chunk);
-                                        let mut m = protos::Message::new();
-                                        match m.merge_from(&mut cis) {
-                                            Ok(_) => {}
-                                            Err(e) => {
-                                                println!("failed to parse message: {}", e);
-                                                println!("{:?}", chunk);
-                                            }
-                                        }
-
-                                        let marc = Arc::new(m);
-
-                                        for l in self.listeners.iter() {
-                                            l.send(marc.clone()).unwrap();
-                                        }
-                                    }
-                                    None => println!("failed to read {} bytes", size),
-                                },
-                                Err(e) => {
-                                    if e.kind() == ErrorKind::WouldBlock
-                                        || e.kind() == ErrorKind::ConnectionReset
-                                    {
-                                        continue;
-                                    } else {
-                                        println!("error reading: {}", e);
+                    let (ref mut stream, _) = self.sessions.get_mut(&event.token()).unwrap();
+                    let mut buffer = [0; 256];
+                    match read_chunk(&mut buffer, stream) {
+                        Ok(0) => println!("event with no output"),
+                        Ok(size) => match buffer.chunks(size).next() {
+                            Some(chunk) => {
+                                println!("received {} bytes", size);
+                                let mut cis = protobuf::stream::CodedInputStream::from_bytes(chunk);
+                                let mut m = protos::Message::new();
+                                match m.merge_from(&mut cis) {
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        println!("failed to parse message: {}", e);
+                                        println!("{:?}", chunk);
                                     }
                                 }
+
+                                let marc = Arc::new(m);
+                                for l in self.listeners.iter() {
+                                    let sender_copy = self.writer_sender.clone();
+                                    l.send((marc.clone(), event.token(), sender_copy)).unwrap();
+                                }
+                            }
+                            None => println!("failed to read {} bytes", size),
+                        },
+                        Err(e) => {
+                            if e.kind() == ErrorKind::WouldBlock
+                                || e.kind() == ErrorKind::ConnectionReset
+                            {
+                                continue;
+                            } else {
+                                println!("error reading: {}", e);
                             }
                         }
-                        None => {}
                     }
                 }
             }
         }
     }
 
-    pub fn add_listener(self: &mut Self, l: Sender<Arc<protos::Message>>) {
+    pub fn add_listener(
+        self: &mut Self,
+        l: Sender<(Arc<protos::Message>, Token, Sender<WriterEvent>)>,
+    ) {
         self.listeners.push(l);
     }
 }
