@@ -9,14 +9,44 @@ use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::io::Result;
 use std::net::SocketAddr;
-use std::ops::Deref;
+use std::result;
 use std::sync::mpsc;
+use std::sync::mpsc::SendError;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::thread;
 use std::thread::JoinHandle;
 
 const SERVER_TOKEN: Token = Token(0);
+
+pub struct SendMessage {
+    sender: Sender<WriterEvent>,
+    token: Token,
+}
+
+impl SendMessage {
+    pub fn send(
+        self: &Self,
+        msg: Arc<protos::Message>,
+    ) -> result::Result<(), SendError<Arc<protos::Message>>> {
+        match self
+            .sender
+            .send(WriterEvent::WriteData((self.token, msg.clone())))
+        {
+            Ok(()) => Ok(()),
+            Err(_) => Err(SendError(msg.clone())),
+        }
+    }
+}
+
+impl Clone for SendMessage {
+    fn clone(&self) -> Self {
+        SendMessage {
+            token: self.token,
+            sender: self.sender.clone(),
+        }
+    }
+}
 
 fn next_token(sessions: &HashMap<Token, (TcpStream, SocketAddr)>) -> Token {
     let mut t = 1;
@@ -41,7 +71,7 @@ fn read_chunk(buffer: &mut [u8], stream: &mut TcpStream) -> Result<(usize)> {
     }
 }
 
-pub enum WriterEvent {
+enum WriterEvent {
     NewConnection((Token, TcpStream, SocketAddr)),
     WriteData((Token, Arc<protos::Message>)),
 }
@@ -49,7 +79,7 @@ pub enum WriterEvent {
 pub struct Server {
     sessions: HashMap<Token, (TcpStream, SocketAddr)>,
     tcp_listener: TcpListener,
-    listeners: Vec<Sender<(Arc<protos::Message>, Token, Sender<WriterEvent>)>>,
+    listeners: Vec<Sender<(Arc<protos::Message>, SendMessage)>>,
     poll: Poll,
     writer_sender: Sender<WriterEvent>,
     writer_thread: JoinHandle<()>,
@@ -150,8 +180,13 @@ impl Server {
 
                                 let marc = Arc::new(m);
                                 for l in self.listeners.iter() {
-                                    let sender_copy = self.writer_sender.clone();
-                                    l.send((marc.clone(), event.token(), sender_copy)).unwrap();
+                                    l.send((
+                                        marc.clone(),
+                                        SendMessage {
+                                            token: event.token(),
+                                            sender: self.writer_sender.clone(),
+                                        },
+                                    )).unwrap();
                                 }
                             }
                             None => println!("failed to read {} bytes", size),
@@ -171,10 +206,7 @@ impl Server {
         }
     }
 
-    pub fn add_listener(
-        self: &mut Self,
-        l: Sender<(Arc<protos::Message>, Token, Sender<WriterEvent>)>,
-    ) {
+    pub fn add_listener(self: &mut Self, l: Sender<(Arc<protos::Message>, SendMessage)>) {
         self.listeners.push(l);
     }
 }

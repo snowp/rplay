@@ -1,7 +1,5 @@
 use super::protos;
 use super::server;
-use mio::Token;
-use std::boxed::Box;
 use std::sync::mpsc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
@@ -14,7 +12,7 @@ pub struct Dispatcher {
 
 impl Dispatcher {
     pub fn new<F>(
-        receiver: Receiver<(Arc<protos::Message>, Token, Sender<server::WriterEvent>)>,
+        receiver: Receiver<(Arc<protos::Message>, server::SendMessage)>,
         num_workers: u32,
         f: F,
     ) -> Self
@@ -22,9 +20,8 @@ impl Dispatcher {
         F: Send + Sync + 'static + Fn(&protos::Message) -> protos::Message,
     {
         let mut ready_channels: Vec<Receiver<bool>> = Vec::new();
-        let mut sender_channels: Vec<
-            Sender<(Arc<protos::Message>, Token, Sender<server::WriterEvent>)>,
-        > = Vec::new();
+        let mut sender_channels: Vec<Sender<(Arc<protos::Message>, server::SendMessage)>> =
+            Vec::new();
         let mut threads: Vec<JoinHandle<()>> = Vec::new();
 
         let farc = Arc::new(f);
@@ -39,10 +36,9 @@ impl Dispatcher {
                 ready_sender.send(true).unwrap();
                 loop {
                     match work_receiver.recv() {
-                        Ok((msg, token, sender)) => {
+                        Ok((msg, sender)) => {
                             let response = farcc(&msg);
-                            sender
-                                .send(server::WriterEvent::WriteData((token, Arc::new(response))));
+                            sender.send(Arc::new(response)).unwrap();
                             ready_sender.send(true).unwrap();
                         }
                         Err(e) => println!("got error while waiting for work {}", e),
