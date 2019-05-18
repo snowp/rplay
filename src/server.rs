@@ -89,7 +89,7 @@ pub struct Server {
     listeners: Vec<Sender<(Arc<protos::Message>, SendMessage)>>,
     poll: Poll,
     writer_sender: Sender<WriterEvent>,
-    writer_thread: JoinHandle<()>,
+    _writer_thread: JoinHandle<()>,
 }
 
 impl Server {
@@ -104,7 +104,7 @@ impl Server {
             listeners: Vec::new(),
             poll: Poll::new().unwrap(),
             writer_sender: writer_sender,
-            writer_thread: thread::spawn(move || {
+            _writer_thread: thread::spawn(move || {
                 let mut sessions = HashMap::new();
                 loop {
                     match writer_receiver.recv().unwrap() {

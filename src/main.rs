@@ -10,7 +10,7 @@ mod server;
 use std::env;
 use std::sync::mpsc;
 
-fn handler<'a, F, S, T, A>(msg: &protos::Message, f: F, api: &'a A) -> protos::Message
+fn handler<'a, F, S, T, A>(msg: &protos::Message, f: F, api: &'a mut A) -> protos::Message
 where
     F: Fn(&S, &'a A) -> T,
     S: protobuf::Message,
@@ -21,16 +21,18 @@ where
     let mut cos = protobuf::CodedInputStream::from_bytes(msg.get_body());
     request.merge_from(&mut cos).unwrap();
 
-    let response = f(&request, &api);
     let mut m = protos::Message::new();
-    m.set_body(response.write_to_bytes().unwrap());
+    {
+        let response = f(&request, api);
+        m.set_body(response.write_to_bytes().unwrap());
+    }
 
     m
 }
 
 macro_rules! handle {
     ($t:ty, $name1:expr => $handler1:expr, $($name:expr => $handler:expr),*) => {{
-        |msg: &protos::Message, api: &$t| -> protos::Message {
+        |msg: &protos::Message, api: &mut $t| -> protos::Message {
          match msg.get_method() {
             $name1 => handler(msg, $handler1, api),
             $(
@@ -64,8 +66,8 @@ fn main() {
             4,
             handle!{
                 redis_api::RedisTlsApi,
-                "Echo" => |_request: &protos::Ping, api: &redis_api::RedisTlsApi| -> protos::Pong { protos::Pong::new() },
-                "Bara" => |_request: &protos::Ping, api: &redis_api::RedisTlsApi| -> protos::Pong { protos::Pong::new() }
+                "Echo" => |_request: &protos::Ping, _api: &redis_api::RedisTlsApi| -> protos::Pong { protos::Pong::new() },
+                "Bara" => |_request: &protos::Ping, _api: &redis_api::RedisTlsApi| -> protos::Pong { protos::Pong::new() }
             },
             &api,
         );
