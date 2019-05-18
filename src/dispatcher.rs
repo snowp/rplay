@@ -105,7 +105,7 @@ mod tests {
     use protos;
     use server::MessageSender;
     use std::result;
-    use std::sync::mpsc::Sender;
+    use std::sync::mpsc::{Receiver, Sender};
     use std::sync::{mpsc, Arc, Condvar, Mutex};
     use std::thread;
 
@@ -168,102 +168,104 @@ mod tests {
         }
     }
 
-    #[test]
-    fn verify_receiver() {
-        let (api_sender, api_receiver) = mpsc::channel();
-        let (sender, receiver) = mpsc::channel();
-
-        let pair = Arc::new((Mutex::new(()), Condvar::new()));
-        let api = TestApi {
-            sender: api_sender,
-            cvar_pair: pair.clone(),
-        };
-        let handled;
-        {
-            let _ = dispatcher::Dispatcher::new(
-                receiver,
-                1,
-                move |msg: &protos::Message, api: &mut TlsTestApi| -> protos::Message {
-                    api.sender
-                        .send((msg.clone(), thread::current().id()))
-                        .unwrap();
-                    protos::Message::new()
-                },
-                &api,
-            );
-
-            let mut m = protos::Message::new();
-            m.set_method("first".to_string());
-            sender.send((Arc::new(m), TestSender {})).unwrap();
-
-            let (h, _) = api_receiver.recv().unwrap();
-            handled = h;
-        }
-        assert_eq!(handled.get_method(), "first".to_string());
+    struct TestDispatcer {
+        _dispatcher: dispatcher::Dispatcher,
+        dispatch_sender: Sender<(Arc<protos::Message>, TestSender)>,
+        test_receiver: Receiver<(protos::Message, thread::ThreadId)>,
+        condvar_pair: Arc<(Mutex<()>, Condvar)>,
     }
 
-    #[test]
-    fn verify_multithreaded() {
-        let (api_sender, api_receiver) = mpsc::channel();
-        let (sender, receiver) = mpsc::channel();
+    impl TestDispatcer {
+        fn new(num_workers: u32) -> TestDispatcer {
+            let (api_sender, api_receiver) = mpsc::channel();
+            let (sender, receiver) = mpsc::channel();
 
-        let pair = Arc::new((Mutex::new(()), Condvar::new()));
-
-        let api = TestApi {
-            sender: api_sender,
-            cvar_pair: pair.clone(),
-        };
-        let handled;
-        let tid1;
-        let tid2;
-        {
-            let _ = dispatcher::Dispatcher::new(
-                receiver,
-                2,
-                move |msg: &protos::Message, api: &mut TlsTestApi| -> protos::Message {
-                    api.handle(&msg);
-                    protos::Message::new()
-                },
-                &api,
-            );
-
-            {
-                let mut m = protos::Message::new();
-                m.set_method("blocked".to_string());
-                sender.send((Arc::new(m), TestSender {})).unwrap();
+            let pair = Arc::new((Mutex::new(()), Condvar::new()));
+            let api = TestApi {
+                sender: api_sender,
+                cvar_pair: pair.clone(),
+            };
+            TestDispatcer {
+                _dispatcher: dispatcher::Dispatcher::new(
+                    receiver,
+                    num_workers,
+                    move |msg: &protos::Message, api: &mut TlsTestApi| -> protos::Message {
+                        api.handle(&msg);
+                        protos::Message::new()
+                    },
+                    &api,
+                ),
+                dispatch_sender: sender,
+                test_receiver: api_receiver,
+                condvar_pair: pair,
             }
+        }
 
-            {
-                let mut m = protos::Message::new();
-                m.set_method("first".to_string());
-                sender.send((Arc::new(m), TestSender {})).unwrap();
-            }
+        fn dispatch_msg(self: &Self, msg: &protos::Message) {
+            self.dispatch_sender
+                .send((Arc::new(msg.clone()), TestSender {}))
+                .unwrap();
+        }
 
-            // Receive "second", as "first" is blocked on the cond var.
-            let (_, t) = api_receiver.recv().unwrap();
-            tid2 = t;
+        fn recv_handled(self: &Self) -> (protos::Message, thread::ThreadId) {
+            self.test_receiver.recv().unwrap()
+        }
 
-            // Keep notifying the condvar until we get something on the receiver;
-            // this means that "first" has been unblocked.
+        fn handle_blocked(self: &Self) -> (protos::Message, thread::ThreadId) {
             loop {
-                let &(ref lock, ref cvar) = &*pair;
+                let &(ref lock, ref cvar) = &*self.condvar_pair;
                 {
                     let _ = lock.lock().unwrap();
                     cvar.notify_one();
                 }
-                match api_receiver.try_recv() {
+                match self.test_receiver.try_recv() {
                     Ok((h, t)) => {
-                        handled = h;
-                        tid1 = t;
-                        break;
+                        return (h, t);
                     }
                     Err(_) => {}
                 }
             }
         }
+    }
+
+    #[test]
+    fn verify_receiver() {
+        let test_dispatcher = TestDispatcer::new(1);
+        {
+            let mut m = protos::Message::new();
+            m.set_method("first".to_string());
+            test_dispatcher.dispatch_msg(&m);
+        }
+
+        let (h, _) = test_dispatcher.recv_handled();
+        assert_eq!(h.get_method(), "first".to_string());
+    }
+
+    #[test]
+    fn verify_multithreaded() {
+        let test_dispatcher = TestDispatcer::new(2);
+
+        {
+            let mut m = protos::Message::new();
+            m.set_method("blocked".to_string());
+            test_dispatcher.dispatch_msg(&m);
+        }
+
+        {
+            let mut m = protos::Message::new();
+            m.set_method("not blocked".to_string());
+            test_dispatcher.dispatch_msg(&m);
+        }
+
+        // We can immediately receive the message that wasn't blocked.
+        let (h1, t1) = test_dispatcher.recv_handled();
+        assert_eq!(h1.get_method(), "not blocked".to_string());
+
+        // Trigger the cond var and receive the blocked message.
+        let (h2, t2) = test_dispatcher.handle_blocked();
+        assert_eq!(h2.get_method(), "blocked".to_string());
 
         // Verify that first and second was handled on separate threads.
-        assert_eq!(handled.get_method(), "blocked".to_string());
-        assert_ne!(tid1, tid2);
+        assert_ne!(t1, t2);
     }
 }
