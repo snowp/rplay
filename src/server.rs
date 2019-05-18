@@ -19,13 +19,20 @@ use std::thread::JoinHandle;
 
 const SERVER_TOKEN: Token = Token(0);
 
+pub trait MessageSender {
+    fn send(
+        self: &Self,
+        msg: Arc<protos::Message>,
+    ) -> result::Result<(), SendError<Arc<protos::Message>>>;
+}
+
 pub struct SendMessage {
     sender: Sender<WriterEvent>,
     token: Token,
 }
 
-impl SendMessage {
-    pub fn send(
+impl MessageSender for SendMessage {
+    fn send(
         self: &Self,
         msg: Arc<protos::Message>,
     ) -> result::Result<(), SendError<Arc<protos::Message>>> {

@@ -1,24 +1,27 @@
 extern crate mio;
 extern crate protobuf;
+mod api;
 mod client;
 mod dispatcher;
 mod protos;
+mod redis_api;
 mod server;
 
 use std::env;
 use std::sync::mpsc;
 
-fn handler<F, S, T>(msg: &protos::Message, f: F) -> protos::Message
+fn handler<'a, F, S, T, A>(msg: &protos::Message, f: F, api: &'a A) -> protos::Message
 where
-    F: Fn(&S) -> T,
+    F: Fn(&S, &'a A) -> T,
     S: protobuf::Message,
     T: protobuf::Message,
+    A: 'a,
 {
     let mut request = S::new();
     let mut cos = protobuf::CodedInputStream::from_bytes(msg.get_body());
     request.merge_from(&mut cos).unwrap();
 
-    let response = f(&request);
+    let response = f(&request, &api);
     let mut m = protos::Message::new();
     m.set_body(response.write_to_bytes().unwrap());
 
@@ -26,14 +29,15 @@ where
 }
 
 macro_rules! handle {
-    ($name1:expr => $handler1:expr, $($name:expr => $handler:expr),*) => {{
-        |msg| match msg.get_method() {
-            $name1 => handler(msg, $handler1),
+    ($t:ty, $name1:expr => $handler1:expr, $($name:expr => $handler:expr),*) => {{
+        |msg: &protos::Message, api: &$t| -> protos::Message {
+         match msg.get_method() {
+            $name1 => handler(msg, $handler1, api),
             $(
-                $name => handler(msg, $handler),
+                $name => handler(msg, $handler, api),
             )*
             _ => protos::Message::new(),
-        }}
+        }}}
     };
 }
 
@@ -52,13 +56,18 @@ fn main() {
         let (s, r) = mpsc::channel();
         server.add_listener(s);
 
+        let api = redis_api::RedisApi {
+            addr: "127.0.0.1:6379".to_string(),
+        };
         let _ = dispatcher::Dispatcher::new(
             r,
-            32,
+            4,
             handle!{
-                "Echo" => |_request: &protos::Ping| -> protos::Pong { protos::Pong::new() },
-                "Bara" => |_request: &protos::Ping| -> protos::Pong { protos::Pong::new() }
+                redis_api::RedisTlsApi,
+                "Echo" => |_request: &protos::Ping, api: &redis_api::RedisTlsApi| -> protos::Pong { protos::Pong::new() },
+                "Bara" => |_request: &protos::Ping, api: &redis_api::RedisTlsApi| -> protos::Pong { protos::Pong::new() }
             },
+            &api,
         );
         server.start();
     }
