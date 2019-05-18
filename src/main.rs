@@ -66,8 +66,8 @@ fn main() {
             4,
             handle!{
                 redis_api::RedisTlsApi,
-                "Echo" => |_request: &protos::Ping, _api: &redis_api::RedisTlsApi| -> protos::Pong { protos::Pong::new() },
-                "Bara" => |_request: &protos::Ping, _api: &redis_api::RedisTlsApi| -> protos::Pong { protos::Pong::new() }
+                "Echo" => |_request: &protos::Ping, _api| -> protos::Pong { protos::Pong::new() },
+                "Bara" => |_request: &protos::Ping, _api| -> protos::Pong { protos::Pong::new() }
             },
             &api,
         );
